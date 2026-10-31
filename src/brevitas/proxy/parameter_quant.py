@@ -233,28 +233,28 @@ class WeightQuantProxyFromInjector(WeightQuantProxyFromInjectorBase):
         return IntQuantTensor(*qt_args, self.is_signed, self.training)
 
 
-class DecoupledWeightQuantProxyFromInjector(WeightQuantProxyFromInjector):
+# class DecoupledWeightQuantProxyFromInjector(WeightQuantProxyFromInjector):
 
-    def pre_scale(self):
-        if not self.is_quant_enabled:
-            return None
-        output_tuple = self.tensor_quant(self.tracked_parameter_list[0])
-        out, scale, zero_point, bit_width, pre_scale, pre_zero_point = output_tuple
-        return pre_scale
+#     def pre_scale(self):
+#         if not self.is_quant_enabled:
+#             return None
+#         output_tuple = self.tensor_quant(self.tracked_parameter_list[0])
+#         out, scale, zero_point, bit_width, pre_scale, pre_zero_point = output_tuple
+#         return pre_scale
 
-    def pre_zero_point(self):
-        if not self.is_quant_enabled:
-            return None
-        output_tuple = self.tensor_quant(self.tracked_parameter_list[0])
-        out, scale, zero_point, bit_width, pre_scale, pre_zero_point = output_tuple
-        return pre_zero_point
+#     def pre_zero_point(self):
+#         if not self.is_quant_enabled:
+#             return None
+#         output_tuple = self.tensor_quant(self.tracked_parameter_list[0])
+#         out, scale, zero_point, bit_width, pre_scale, pre_zero_point = output_tuple
+#         return pre_zero_point
 
-    def create_quant_tensor(self, qt_args: Tuple[Any]) -> IntQuantTensor:
-        out, scale, zero_point, bit_width, pre_scale, pre_zero_point = qt_args
-        return IntQuantTensor(out, scale, zero_point, bit_width, self.is_signed, self.training)
+#     def create_quant_tensor(self, qt_args: Tuple[Any]) -> IntQuantTensor:
+#         out, scale, zero_point, bit_width, pre_scale, pre_zero_point = qt_args
+#         return IntQuantTensor(out, scale, zero_point, bit_width, self.is_signed, self.training)
 
 
-class DecoupledWeightQuantWithInputProxyFromInjector(DecoupledWeightQuantProxyFromInjector):
+class DecoupledWeightQuantWithInputProxyFromInjector(WeightQuantProxyFromInjector):
 
     def __init__(self, quant_layer: nn.Module, quant_injector: Injector) -> None:
         super().__init__(quant_layer, quant_injector)
@@ -265,41 +265,85 @@ class DecoupledWeightQuantWithInputProxyFromInjector(DecoupledWeightQuantProxyFr
 
     @property
     def requires_quant_input(self):
-        return True
+        if self.quant_injector.requires_input_scale:
+            return True
+        return False
 
     def pre_scale(self):
-        raise NotImplementedError
+        if not self.is_quant_enabled:
+            return None
+        elif self.quant_injector.requires_input_scale:
+            raise NotImplementedError
+        output_tuple = self.tensor_quant(self.tracked_parameter_list[0])
+        out, scale, zero_point, bit_width, pre_scale, pre_zero_point = output_tuple
+        return pre_scale
 
     def pre_zero_point(self):
-        raise NotImplementedError
+        if not self.is_quant_enabled:
+            return None
+        elif self.quant_injector.requires_input_scale:
+            raise NotImplementedError
+        output_tuple = self.tensor_quant(self.tracked_parameter_list[0])
+        out, scale, zero_point, bit_width, pre_scale, pre_zero_point = output_tuple
+        return pre_zero_point
+
+    def create_quant_tensor(self, qt_args: Tuple[Any]) -> IntQuantTensor:
+        out, scale, zero_point, bit_width, pre_scale, pre_zero_point = qt_args
+        return IntQuantTensor(out, scale, zero_point, bit_width, self.is_signed, self.training)
 
     def forward(
         self,
         x: torch.Tensor,
         quant_input: Optional[Union[Tensor,
                                     IntQuantTensor]] = None) -> Union[Tensor, IntQuantTensor]:
-        if isinstance(quant_input,
-                      IntQuantTensor) and not self.training and self.cache_inference_quant_act:
-            cached_inp = _CachedIO(quant_input.detach(), self.cache_quant_io_metadata_only)
-            self._cached_act = cached_inp
+        if self.quant_injector.requires_input_scale:
+            if isinstance(quant_input,
+                          IntQuantTensor) and not self.training and self.cache_inference_quant_act:
+                cached_inp = _CachedIO(quant_input.detach(), self.cache_quant_io_metadata_only)
+                self._cached_act = cached_inp
 
-        if self.is_quant_enabled:
-            if quant_input is None or isinstance(quant_input, Tensor):
-                assert self._cached_act is not None, "No cached quant input found. Enable caching and perform a forward pass"
-                quant_input = self._cached_act
-            else:
-                assert isinstance(quant_input, IntQuantTensor), "Input must be quantized"
+            if self.is_quant_enabled:
+                if quant_input is None or isinstance(quant_input, Tensor):
+                    assert self._cached_act is not None, "No cached quant input found. Enable caching and perform a forward pass"
+                    quant_input = self._cached_act
+                else:
+                    assert isinstance(quant_input, IntQuantTensor), "Input must be quantized"
 
-            input_bit_width = quant_input.bit_width
-            input_is_signed = quant_input.signed
+                input_bit_width = quant_input.bit_width
+                input_is_signed = quant_input.signed
 
-            impl = self.export_handler if self.export_mode else self.tensor_quant
-            out, scale, zero_point, bit_width, pre_scale, pre_zero_point = impl(x, input_bit_width, input_is_signed)
-            if self.skip_create_quant_tensor:
-                return out
-            return IntQuantTensor(out, scale, zero_point, bit_width, self.is_signed, self.training)
-        else:  # quantization disabled
-            return x
+                impl = self.export_handler if self.export_mode else self.tensor_quant
+                out, scale, zero_point, bit_width, pre_scale, pre_zero_point = impl(x, input_bit_width, input_is_signed)
+                if self.skip_create_quant_tensor:
+                    return out
+                return IntQuantTensor(
+                    out, scale, zero_point, bit_width, self.is_signed, self.training)
+            else:  # quantization disabled
+                return x
+        else:
+            if self.is_quant_enabled:
+                # If quant is enabled the priority is:
+                # - export mode
+                # - quantization flow
+                if self.export_mode:
+                    out = self.export_handler(x)
+                    if self.skip_create_quant_tensor:
+                        out = out[0]
+                    else:
+                        out = self.create_quant_tensor(out)
+                else:
+                    out = self.tensor_quant(x)
+                    if self.skip_create_quant_tensor:
+                        out = out[0]
+                    else:
+                        out = self.create_quant_tensor(out)
+                        if not self.training and self.cache_inference_quant_weight and self._cached_weight is None:
+                            self._cached_weight = self.cache_class(
+                                out.detach(),
+                                metadata_only=self.cache_inference_quant_weight_metadata_only)
+            else:  # quantization disabled
+                out = x
+            return out
 
 
 class BiasQuantProxyFromInjector(BiasQuantProxyFromInjectorBase):
